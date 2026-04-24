@@ -1,0 +1,40 @@
+{"timestamp": "2026-04-24 23:43:09", "max_g": 1019.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:21", "max_g": 1200.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:24", "max_g": 10200.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:33", "max_g": 2003.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:33", "max_g": 317.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:33", "max_g": 8609.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:38", "max_g": 1104.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:41", "max_g": 1704.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:45", "max_g": 106.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:51", "max_g": 100.0, "alert": true}
+{"timestamp": "2026-04-24 23:43:55", "max_g": 108.0, "alert": true}
+{"timestamp": "2026-04-24 23:44:01", "max_g": 20006.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:26", "max_g": 17.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:30", "max_g": 16.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:33", "max_g": 10.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:34", "max_g": 34.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:36", "max_g": 34.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:43", "max_g": 10522.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:47", "max_g": 109.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:52", "max_g": 940.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:53", "max_g": 1100.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:55", "max_g": 816.0, "alert": true}
+{"timestamp": "2026-04-24 23:49:56", "max_g": 904.0, "alert": true}
+{"timestamp": "2026-04-24 23:50:01", "max_g": 90104.0, "alert": true}
+{"timestamp": "2026-04-24 23:50:06", "max_g": 109.0, "alert": true}
+{"timestamp": "2026-04-24 23:50:15", "max_g": 805.0, "alert": true}
+{"timestamp": "2026-04-24 23:50:19", "max_g": 9905.0, "alert": true}
+{"timestamp": "2026-04-24 23:50:26", "max_g": 107.0, "alert": true}
+{"time": "23:53:44", "g": 179.993}
+{"time": "23:53:46", "g": 79.993}
+{"time": "00:07:04", "g": 57.0}
+{"time": "00:07:14", "g": 101.0}
+{"time": "00:07:16", "g": 103.0}
+{"time": "00:07:22", "g": 97.0}
+{"time": "00:07:43", "g": 104.082}
+{"time": "00:09:15", "g": 101.0}
+{"time": "00:09:26", "g": 100.0}
+{"time": "00:09:31", "g": 40.0}
+{"time": "00:09:33", "g": 100.63}
+{"time": "00:09:42", "g": 101.0}
