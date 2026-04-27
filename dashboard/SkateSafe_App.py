@@ -14,6 +14,7 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parent.parent
 USERS_PATH = ROOT_DIR / "users.json"
 IMPACT_LOG_PATH = ROOT_DIR / "impact_log.json"
+USER_HEALTH_LOGS_PATH = ROOT_DIR / "user_health_logs.json"
 FHIR_BASE_URL = "https://tzuchi-fhir.ddns.net/fhir"
 DEFAULT_BG_COLOR = "#0e1117"
 ALERT_BG_COLOR = "#4a0000"
@@ -87,6 +88,60 @@ def save_users(users_payload):
         json.dumps(users_payload, indent=2),
         encoding="utf-8",
     )
+
+
+def get_current_user_id():
+    patient_id = st.session_state.get("patient_id", "")
+    if "/" not in patient_id:
+        return ""
+    return patient_id.split("/", 1)[1]
+
+
+def load_user_health_logs(show_error=True):
+    if not USER_HEALTH_LOGS_PATH.exists():
+        return []
+
+    try:
+        health_logs = json.loads(USER_HEALTH_LOGS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        if show_error:
+            st.error("user_health_logs.json 格式無效，無法讀取健康紀錄。")
+        return None
+
+    if not isinstance(health_logs, list):
+        if show_error:
+            st.error("user_health_logs.json 必須是 JSON 陣列。")
+        return None
+
+    return health_logs
+
+
+def save_user_health_logs(logs):
+    USER_HEALTH_LOGS_PATH.write_text(
+        json.dumps(logs, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def append_user_health_log(entry):
+    health_logs = load_user_health_logs(show_error=False)
+    if health_logs is None:
+        raise ValueError("user_health_logs.json 格式無效，無法寫入健康紀錄。")
+
+    health_logs.append(entry)
+    save_user_health_logs(health_logs)
+
+
+def get_recent_user_health_logs(user_id, limit=10):
+    health_logs = load_user_health_logs(show_error=True)
+    if health_logs is None:
+        return []
+
+    user_logs = [
+        entry for entry in health_logs if entry.get("user_id") == user_id
+    ]
+    user_logs.sort(key=lambda entry: entry.get("timestamp", ""), reverse=True)
+    return user_logs[:limit]
 
 
 def normalize_email(email):
@@ -516,7 +571,56 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 
+current_user_id = get_current_user_id()
+
 st.caption(f"目前登入者：{st.session_state.user_name}")
+
+with st.expander("📝 自主健康回報"):
+    report_symptom = st.selectbox(
+        "症狀",
+        ["無", "頭痛", "暈眩", "噁心", "關節痠痛", "其他"],
+    )
+    report_note = st.text_area("詳細說明")
+
+    if st.button("提交回報"):
+        report_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "user_id": current_user_id,
+            "type": "subjective_report",
+            "symptom": report_symptom,
+            "note": report_note.strip(),
+            "g_force": None,
+        }
+
+        try:
+            append_user_health_log(report_entry)
+            st.success("自主健康回報已儲存。")
+        except (OSError, ValueError) as exc:
+            st.error(f"無法儲存健康回報：{exc}")
+
+
+st.subheader("📅 歷史健康紀錄")
+recent_health_logs = get_recent_user_health_logs(current_user_id, limit=10)
+
+if recent_health_logs:
+    type_labels = {
+        "subjective_report": "自主回報",
+        "impact_event": "重擊事件",
+    }
+    history_rows = [
+        {
+            "時間": entry.get("timestamp", ""),
+            "類型": type_labels.get(entry.get("type", ""), entry.get("type", "")),
+            "症狀": entry.get("symptom", ""),
+            "說明": entry.get("note", ""),
+            "G 值": entry.get("g_force"),
+        }
+        for entry in recent_health_logs
+    ]
+    history_df = pd.DataFrame(history_rows)
+    st.dataframe(history_df, use_container_width=True, hide_index=True)
+else:
+    st.info("尚無紀錄")
 
 col1, col2 = st.columns([1, 2])
 
@@ -585,6 +689,18 @@ if ser:
                     }
                     with IMPACT_LOG_PATH.open("a", encoding="utf-8") as log_file:
                         log_file.write(json.dumps(log_entry) + "\n")
+                    impact_event_entry = {
+                        "timestamp": datetime.now().isoformat(),
+                        "user_id": current_user_id,
+                        "type": "impact_event",
+                        "symptom": "",
+                        "note": "偵測到重擊事件",
+                        "g_force": val,
+                    }
+                    try:
+                        append_user_health_log(impact_event_entry)
+                    except (OSError, ValueError):
+                        pass
                 else:
                     st.session_state.bg_color = DEFAULT_BG_COLOR
 
