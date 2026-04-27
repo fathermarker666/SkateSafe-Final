@@ -4,7 +4,7 @@ import subprocess
 # --- 請填寫你的資訊 ---
 GITHUB_USER = "fathermarker666"
 REPO_NAME = "SkateSafe-Final"
-COMMIT_MSG = "Initial commit: 決賽實時監控系統完整版 (含硬體通訊與網頁優化)"
+COMMIT_MSG = "登入系統功能完成"
 
 def run_command(command):
     try:
