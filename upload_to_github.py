@@ -4,7 +4,7 @@ import subprocess
 # --- 請填寫你的資訊 ---
 GITHUB_USER = "fathermarker666"
 REPO_NAME = "SkateSafe-Final"
-COMMIT_MSG = "登入系統功能完成"
+COMMIT_MSG = "首頁製作，個功能按鈕化，問卷優化，目前有圖形卡頓問題"
 
 def run_command(command):
     try:
