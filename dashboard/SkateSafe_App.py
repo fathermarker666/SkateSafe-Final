@@ -5,10 +5,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import requests
 import serial
 import streamlit as st
+from serial.tools import list_ports
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -34,8 +36,10 @@ def initialize_session_state():
     defaults = {
         "bg_color": DEFAULT_BG_COLOR,
         "offset": 0.0,
-        "history": [],
+        "history": [0.0] * 40,
         "smooth_val": 0.0,
+        "raw_total_window": [],
+        "logged_in": False,
         "authenticated": False,
         "user_email": "",
         "user_name": "",
@@ -47,9 +51,16 @@ def initialize_session_state():
         "current_g_force": None,
         "page": "home",
         "show_auth_panel": False,
+        "selected_port": "COM8",
         "is_monitoring": False,
         "has_impact_occurred": False,
         "impact_flash_until": 0.0,
+        "latest_impact_fhir_json": "",
+        "show_monitor_debug": False,
+        "serial_debug_raw_line": "",
+        "serial_debug_last_total_g": None,
+        "serial_debug_last_error": "",
+        "serial_debug_unit_mode": "未判定",
     }
 
     for key, value in defaults.items():
@@ -60,12 +71,18 @@ def initialize_session_state():
 def reset_monitoring_state():
     st.session_state.bg_color = DEFAULT_BG_COLOR
     st.session_state.offset = 0.0
-    st.session_state.history = []
+    st.session_state.history = [0.0] * 40
     st.session_state.smooth_val = 0.0
+    st.session_state.raw_total_window = []
+    st.session_state.serial_debug_raw_line = ""
+    st.session_state.serial_debug_last_total_g = None
+    st.session_state.serial_debug_last_error = ""
+    st.session_state.serial_debug_unit_mode = "未判定"
 
 
 def clear_auth_state():
     close_serial_connection()
+    st.session_state.logged_in = False
     st.session_state.authenticated = False
     st.session_state.user_email = ""
     st.session_state.user_name = ""
@@ -80,6 +97,7 @@ def clear_auth_state():
     st.session_state.is_monitoring = False
     st.session_state.has_impact_occurred = False
     st.session_state.impact_flash_until = 0.0
+    st.session_state.latest_impact_fhir_json = ""
     reset_monitoring_state()
 
 
@@ -555,6 +573,7 @@ def create_remote_patient(name, email, patient_id):
 
 def start_authenticated_session(user_record, patient_resource):
     reset_monitoring_state()
+    st.session_state.logged_in = True
     st.session_state.authenticated = True
     st.session_state.user_email = user_record["email"]
     st.session_state.user_name = user_record["name"]
@@ -582,16 +601,56 @@ def export_to_fhir(g_force, patient_id):
     }
 
 
-@st.cache_resource
-def get_serial_connection():
+def export_history_to_fhir_bundle(history_values, patient_id):
+    exported_at = datetime.now().isoformat()
+    entries = []
+
+    for index, g_force in enumerate(history_values[-40:]):
+        observation = export_to_fhir(g_force, patient_id)
+        observation["effectiveDateTime"] = exported_at
+        observation["note"] = [{"text": f"history_index={index}"}]
+        entries.append({"resource": observation})
+
+    return {
+        "resourceType": "Bundle",
+        "type": "collection",
+        "timestamp": exported_at,
+        "entry": entries,
+    }
+
+
+def get_available_ports():
     try:
-        return serial.Serial("COM8", 115200, timeout=0.01)
+        ports = [port.device for port in list_ports.comports()]
+    except Exception:
+        ports = []
+
+    if "COM8" in ports:
+        ports.remove("COM8")
+        ports.insert(0, "COM8")
+    elif not ports:
+        ports = ["COM8"]
+    else:
+        ports.insert(0, "COM8")
+
+    deduped_ports = []
+    for port in ports:
+        if port not in deduped_ports:
+            deduped_ports.append(port)
+    return deduped_ports
+
+
+@st.cache_resource
+def get_serial_connection(port):
+    try:
+        return serial.Serial(port, 115200, timeout=0.1)
     except serial.SerialException:
         return None
 
 
-def close_serial_connection():
-    ser = get_serial_connection()
+def close_serial_connection(port=None):
+    selected_port = port or st.session_state.get("selected_port", "COM8")
+    ser = get_serial_connection(selected_port)
     if ser:
         try:
             if ser.is_open:
@@ -602,6 +661,7 @@ def close_serial_connection():
 
 
 def start_monitoring_session():
+    close_serial_connection()
     reset_monitoring_state()
     st.session_state.bg_color = DEFAULT_BG_COLOR
     st.session_state.is_monitoring = True
@@ -609,8 +669,8 @@ def start_monitoring_session():
     st.session_state.impact_flash_until = 0.0
     st.session_state.current_g_force = None
     st.session_state.health_form_expanded = False
+    st.session_state.latest_impact_fhir_json = ""
     st.session_state.page = "monitor"
-    st.session_state.chart_obj = None
 
 
 def stop_and_finalize_monitoring():
@@ -618,7 +678,6 @@ def stop_and_finalize_monitoring():
     st.session_state.bg_color = DEFAULT_BG_COLOR
     st.session_state.impact_flash_until = 0.0
     close_serial_connection()
-    st.session_state.chart_obj = None
     if "chart_container" in st.session_state:
         del st.session_state.chart_container
 
@@ -634,8 +693,6 @@ def handle_detected_impact(current_user_id, g_force):
     st.session_state.has_impact_occurred = True
     st.session_state.is_skating = True
     st.session_state.current_g_force = g_force
-    st.session_state.bg_color = ALERT_BG_COLOR
-    st.session_state.impact_flash_until = time.time() + 0.2
 
     log_entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
@@ -656,6 +713,17 @@ def handle_detected_impact(current_user_id, g_force):
         append_user_health_log(impact_event_entry)
     except (OSError, ValueError):
         pass
+
+    if st.session_state.get("patient_id") and st.session_state.history:
+        fhir_bundle = export_history_to_fhir_bundle(
+            st.session_state.history,
+            st.session_state.patient_id,
+        )
+        st.session_state.latest_impact_fhir_json = json.dumps(
+            fhir_bundle,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def upload_fhir_resource(resource_type, resource_payload):
@@ -789,7 +857,7 @@ def render_auth_panel(users_payload):
         with st.form("login_form_main"):
             login_email = st.text_input("電子郵件")
             login_password = st.text_input("密碼", type="password")
-            login_submitted = st.form_submit_button("登入", use_container_width=True)
+            login_submitted = st.form_submit_button("登入", width="stretch")
 
         if login_submitted:
             clear_fhir_debug()
@@ -818,7 +886,7 @@ def render_auth_panel(users_payload):
             register_name = st.text_input("姓名")
             register_email = st.text_input("註冊電子郵件")
             register_password = st.text_input("註冊密碼", type="password")
-            register_submitted = st.form_submit_button("註冊", use_container_width=True)
+            register_submitted = st.form_submit_button("註冊", width="stretch")
 
         if register_submitted:
             clear_fhir_debug()
@@ -927,7 +995,7 @@ def render_questionnaire_section(current_user_id):
     with st.form("structured_health_questionnaire_form"):
         submit_questionnaire = st.form_submit_button(
             "提交到本地 PHR",
-            use_container_width=True,
+            width="stretch",
         )
 
     if submit_questionnaire:
@@ -976,9 +1044,203 @@ def render_history_section(current_user_id):
     if recent_health_logs:
         history_rows = [format_health_log_for_table(entry) for entry in recent_health_logs]
         history_df = pd.DataFrame(history_rows)
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
+        st.dataframe(history_df, width="stretch", hide_index=True)
     else:
         st.info("尚無紀錄。")
+
+
+def parse_serial_sample(line):
+    clean_line = line.strip()
+    if not clean_line:
+        return None, "空白資料列"
+
+    if any(marker in clean_line for marker in ("SkateSafe", "模式啟動", "✅")):
+        return None, "略過啟動訊息"
+
+    fields = [field.strip() for field in clean_line.split(",")]
+    if not fields or not fields[0]:
+        return None, "缺少總加速度欄位"
+
+    try:
+        total_value = float(fields[0])
+    except ValueError:
+        return None, f"總加速度不是數字: {clean_line[:60]}"
+
+    axis_values = []
+    for axis_index, axis_name in enumerate(("x_g", "y_g", "z_g"), start=1):
+        if axis_index >= len(fields) or not fields[axis_index]:
+            axis_values.append(None)
+            continue
+        try:
+            axis_values.append(float(fields[axis_index]))
+        except ValueError:
+            return None, f"{axis_name} 不是數字: {fields[axis_index][:20]}"
+
+    if len(fields) not in (1, 4):
+        st.session_state.serial_debug_last_error = f"欄位數異常: {len(fields)}"
+
+    return {
+        "raw_line": clean_line,
+        "total_g": total_value,
+        "x_g": axis_values[0],
+        "y_g": axis_values[1],
+        "z_g": axis_values[2],
+    }, ""
+
+
+def normalize_total_g(raw_total):
+    raw_window = st.session_state.raw_total_window
+    raw_window.append(float(raw_total))
+    if len(raw_window) > 12:
+        raw_window.pop(0)
+
+    near_gravity_count = sum(7.0 <= value <= 12.0 for value in raw_window)
+    if len(raw_window) >= 6 and near_gravity_count >= max(4, len(raw_window) - 2):
+        st.session_state.serial_debug_unit_mode = "m/s² -> G"
+        return raw_total / 9.80665
+
+    st.session_state.serial_debug_unit_mode = "原始值視為 G"
+    return raw_total
+
+
+def build_monitor_debug_text():
+    raw_line = st.session_state.get("serial_debug_raw_line", "") or "尚未收到資料"
+    last_total = st.session_state.get("serial_debug_last_total_g")
+    last_total_text = "尚未解析成功" if last_total is None else f"{last_total:.3f} G"
+    unit_mode = st.session_state.get("serial_debug_unit_mode", "未判定")
+    last_error = st.session_state.get("serial_debug_last_error", "") or "無"
+
+    return (
+        f"原始資料: {raw_line[:80]} | "
+        f"最近解析: {last_total_text} | "
+        f"單位模式: {unit_mode} | "
+        f"最近錯誤: {last_error[:80]}"
+    )
+
+
+def build_monitor_chart(history_values):
+    window = list(history_values[-40:])
+    if len(window) < 40:
+        window = ([0.0] * (40 - len(window))) + window
+
+    df = pd.DataFrame(
+        {
+            "x": list(range(40)),
+            "g_force": [float(value) for value in window],
+        }
+    )
+
+    recent_abs_max = max((abs(value) for value in window), default=0.0)
+    y_bound = min(max(2.0, recent_abs_max * 1.2), 20.0)
+
+    return (
+        alt.Chart(df)
+        .mark_line(color="#7ee787", strokeWidth=2, interpolate="linear")
+        .encode(
+            x=alt.X(
+                "x:Q",
+                title="樣本索引",
+                scale=alt.Scale(domain=[0, 39]),
+                axis=alt.Axis(
+                    values=[0, 10, 20, 30, 39],
+                    labelColor="#d0d7de",
+                    titleColor="#d0d7de",
+                ),
+            ),
+            y=alt.Y(
+                "g_force:Q",
+                title="G-Force",
+                scale=alt.Scale(domain=[-y_bound, y_bound]),
+                axis=alt.Axis(labelColor="#d0d7de", titleColor="#d0d7de"),
+            ),
+        )
+        .properties(height=350)
+        .configure(background="#0e1117")
+        .configure_view(strokeOpacity=0)
+        .configure_axis(
+            gridColor="#30363d",
+            domainColor="#484f58",
+            tickColor="#484f58",
+        )
+    )
+
+
+@st.fragment(run_every=0.3)
+def render_monitor_fragment(current_user_id, impact_threshold, selected_port):
+    metric_placeholder = st.empty()
+
+    with st.container(height=450):
+        chart_placeholder = st.empty()
+    debug_placeholder = st.empty()
+
+    latest_val = st.session_state.history[-1] if st.session_state.history else 0.0
+
+    if st.session_state.is_monitoring:
+        ser = get_serial_connection(selected_port)
+        if ser:
+            try:
+                if not ser.is_open:
+                    ser.open()
+            except serial.SerialException:
+                st.session_state.is_monitoring = False
+                st.session_state.serial_debug_last_error = "序列埠無法開啟"
+            else:
+                processed = 0
+                while ser.in_waiting > 0 and processed < 12:
+                    line = ser.readline().decode("utf-8", errors="ignore").strip()
+                    st.session_state.serial_debug_raw_line = line
+
+                    if not line:
+                        processed += 1
+                        continue
+
+                    parsed_sample, parse_error = parse_serial_sample(line)
+                    if parse_error:
+                        st.session_state.serial_debug_last_error = parse_error
+                        processed += 1
+                        continue
+
+                    raw_val = parsed_sample["total_g"]
+                    if abs(raw_val) > 150.0:
+                        st.session_state.serial_debug_last_error = (
+                            f"略過異常峰值: {raw_val:.2f}"
+                        )
+                        processed += 1
+                        continue
+
+                    normalized_val = normalize_total_g(raw_val)
+                    st.session_state.serial_debug_last_total_g = normalized_val
+                    st.session_state.serial_debug_last_error = ""
+
+                    st.session_state.smooth_val = (
+                        normalized_val * 0.15
+                    ) + (st.session_state.smooth_val * 0.85)
+                    val = st.session_state.smooth_val - st.session_state.offset
+
+                    if abs(val) < 0.15:
+                        val = 0.0
+
+                    latest_val = val
+                    st.session_state.history.append(val)
+                    st.session_state.history.pop(0)
+
+                    if val >= impact_threshold:
+                        handle_detected_impact(current_user_id, val)
+
+                    processed += 1
+        else:
+            st.session_state.is_monitoring = False
+            st.session_state.serial_debug_last_error = "找不到序列埠連線"
+
+    metric_placeholder.metric("當前加速度", f"{latest_val:.2f} G")
+    chart_placeholder.altair_chart(
+        build_monitor_chart(st.session_state.history),
+        width="stretch",
+    )
+    if st.session_state.get("show_monitor_debug"):
+        debug_placeholder.caption(build_monitor_debug_text())
+    else:
+        debug_placeholder.empty()
 
 
 def render_monitor_section(current_user_id):
@@ -994,234 +1256,124 @@ def render_monitor_section(current_user_id):
             key="impact_threshold",
         )
 
-        if st.button("零點校準", use_container_width=True):
-            if st.session_state.history:
-                recent_window = st.session_state.history[-10:]
-                st.session_state.offset = sum(recent_window) / len(recent_window)
-                st.success(f"校準完成，偏移值：{st.session_state.offset:.2f}")
-            else:
-                st.warning("請先累積幾筆感測資料後再校準。")
+        if st.button("零點校準", width="stretch"):
+            recent_window = st.session_state.history[-10:]
+            st.session_state.offset = sum(recent_window) / len(recent_window)
 
-        if st.button("結束監測", use_container_width=True):
+        if st.button("結束監測", width="stretch"):
             stop_and_finalize_monitoring()
             st.rerun()
 
-        if st.button("匯出最新 FHIR JSON", use_container_width=True):
-            if st.session_state.history:
+        st.toggle(
+            "顯示監測除錯資訊",
+            key="show_monitor_debug",
+            disabled=not st.session_state.is_monitoring,
+        )
+
+        if not st.session_state.is_monitoring:
+            if st.session_state.latest_impact_fhir_json:
+                st.download_button(
+                    "下載 Impact FHIR JSON",
+                    data=st.session_state.latest_impact_fhir_json,
+                    file_name="skatesafe_impact_history.fhir.json",
+                    mime="application/fhir+json",
+                    width="stretch",
+                )
+            elif st.button("預覽最新 FHIR JSON", width="stretch"):
                 st.json(
-                    export_to_fhir(
-                        st.session_state.history[-1],
+                    export_history_to_fhir_bundle(
+                        st.session_state.history,
                         st.session_state.patient_id,
                     )
                 )
-            else:
-                st.warning("目前尚無衝擊資料可匯出。")
-
-        status_placeholder = st.empty()
-        metric_placeholder = st.empty()
-        impact_placeholder = st.empty()
 
     with chart_col:
-        # 關鍵：如果 session_state 中沒有容器，才建立它
-        if "chart_container" not in st.session_state:
-            st.session_state.chart_container = st.empty()
-        
-        # 這裡不需要重複執行 chart_placeholder = st.empty()
-        # 直接使用 session_state 裡的容器
-
-    if not st.session_state.is_monitoring:
-        status_placeholder.info("監測尚未啟動。")
-        if st.session_state.history:
-            metric_placeholder.metric("目前衝擊值", f"{st.session_state.history[-1]:.2f} G")
-            history_df = pd.DataFrame(st.session_state.history, columns=["G-Force"])
-            chart_placeholder.line_chart(history_df, height=350)
-        return
-
-    if (
-        st.session_state.impact_flash_until
-        and time.time() >= st.session_state.impact_flash_until
-    ):
-        st.session_state.bg_color = DEFAULT_BG_COLOR
-        st.session_state.impact_flash_until = 0.0
-
-    ser = get_serial_connection()
-
-    if not ser:
-        status_placeholder.error("無法連線至 COM8")
-        st.session_state.is_monitoring = False
-        return
-
-    status_placeholder.success("COM8 感測器已連線")
-
-    if ser.in_waiting > 100:
-        ser.reset_input_buffer()
-
-    processed = 0
-    latest_val = st.session_state.history[-1] if st.session_state.history else 0.0
-
-    while ser.in_waiting > 0 and processed < 100:
-        try:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not line:
-                processed += 1
-                continue
-
-            raw_val = float(line.split(",")[0])
-
-            if abs(raw_val) > 150.0:
-                processed += 1
-                continue
-
-            if st.session_state.history:
-                diff = abs(raw_val - st.session_state.smooth_val)
-                if diff > 80.0:
-                    processed += 1
-                    continue
-
-            st.session_state.smooth_val = (
-                raw_val * 0.15
-            ) + (st.session_state.smooth_val * 0.85)
-
-            val = st.session_state.smooth_val - st.session_state.offset
-            if abs(val) < 0.15:
-                val = 0.0
-
-            latest_val = val
-            st.session_state.history.append(val)
-            if len(st.session_state.history) > 40:
-                st.session_state.history.pop(0)
-
-            if val >= impact_threshold:
-                handle_detected_impact(current_user_id, val)
-
-            processed += 1
-        except (ValueError, IndexError, serial.SerialException):
-            processed += 1
-            continue
-
-    metric_placeholder.metric("目前衝擊值", f"{latest_val:.2f} G")
-
-    if st.session_state.has_impact_occurred:
-        impact_placeholder.warning("本次監測期間已偵測到至少一次重擊事件。")
-    else:
-        impact_placeholder.info("目前尚未偵測到重擊事件。")
-
-    # --- 最終修正後的繪圖邏輯 (請確保刪除所有 標記) ---
-    if st.session_state.history:
-        # 取得本次循環新增的數據點
-        recent_data = pd.DataFrame(st.session_state.history[-processed:], columns=["G-Force"])
-        
-        # 檢查圖表物件是否有效
-        if "chart_obj" not in st.session_state or st.session_state.chart_obj is None:
-            # 第一次：在持久化的容器中初始化圖表
-            st.session_state.chart_obj = st.session_state.chart_container.line_chart(recent_data, height=350)
-        else:
-            try:
-                # 僅追加數據
-                st.session_state.chart_obj.add_rows(recent_data)
-            except Exception:
-                # 若失效則重新繪製
-                st.session_state.chart_obj = st.session_state.chart_container.line_chart(recent_data, height=350)
-
-    time.sleep(0.12)
-    st.rerun()
+        render_monitor_fragment(
+            current_user_id,
+            impact_threshold,
+            st.session_state.selected_port,
+        )
 
 
-initialize_session_state()
+def render_sidebar_controls():
+    available_ports = get_available_ports()
+    current_port = st.session_state.get("selected_port", "COM8")
+    if current_port not in available_ports:
+        available_ports.insert(0, current_port)
 
-st.markdown(
-    f"""
-    <style>
-        .stApp {{
-            background-color: {st.session_state.bg_color};
-            transition: background-color 0.3s;
-        }}
-        div[data-testid="stButton"] > button {{
-            min-height: 88px;
-            font-size: 1.05rem;
-            font-weight: 700;
-        }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    default_index = available_ports.index(current_port)
 
-try:
-    users_payload = load_users()
-except ValueError as exc:
-    st.error(str(exc))
-    st.error("users.json 格式無效，無法啟動驗證流程。")
-    st.stop()
+    with st.sidebar:
+        st.header("系統設定")
+        st.selectbox(
+            "感測器埠號",
+            available_ports,
+            index=default_index,
+            key="selected_port",
+            disabled=st.session_state.is_monitoring,
+        )
+        st.caption("監測進行中會鎖定埠號，避免連線被中途切換。")
 
-header_left, header_right = st.columns([4, 1])
 
-with header_left:
+def render_login_page(users_payload):
     st.title("SkateSafe 專業監測儀表板")
-
-with header_right:
-    if st.session_state.authenticated:
-        st.caption(f"👤 {st.session_state.patient_id}")
-        if st.button("登出", use_container_width=True):
-            clear_auth_state()
-            st.rerun()
-    else:
-        st.caption("🔑 請先登入")
-        if st.button("登入 / 註冊", use_container_width=True):
-            st.session_state.show_auth_panel = not st.session_state.show_auth_panel
-            st.rerun()
-
-if st.session_state.show_auth_panel:
+    st.info("請先登入後再進入主控台。")
     render_auth_panel(users_payload)
     if st.session_state.get("last_fhir_debug"):
         render_fhir_debug()
-elif not st.session_state.authenticated:
-    st.info("請點選右上角「登入 / 註冊」以開啟驗證表單。")
 
-st.divider()
 
-is_locked = not st.session_state.authenticated
-if is_locked:
-    st.warning("⚠️ 請先完成右上角登入，方可啟動監測與紀錄功能")
-else:
+def render_dashboard(users_payload):
+    header_left, header_right = st.columns([4, 1])
+
+    with header_left:
+        st.title("SkateSafe 專業監測儀表板")
+
+    with header_right:
+        st.caption(f"👤 {st.session_state.patient_id}")
+        if st.button("登出", width="stretch"):
+            clear_auth_state()
+            st.rerun()
+
     st.caption(f"目前登入者：{st.session_state.user_name}")
+    st.divider()
 
-dashboard_row_1 = st.columns(2)
-dashboard_row_2 = st.columns(2)
+    dashboard_row_1 = st.columns(2)
+    dashboard_row_2 = st.columns(2)
 
-with dashboard_row_1[0]:
-    if st.button("🚀 開始監測", use_container_width=True, disabled=is_locked):
-        start_monitoring_session()
+    with dashboard_row_1[0]:
+        if st.button("🚀 開始監測", width="stretch"):
+            start_monitoring_session()
 
-with dashboard_row_1[1]:
-    if st.button("📝 健康回報", use_container_width=True, disabled=is_locked):
-        if st.session_state.is_monitoring:
-            st.warning("請先結束監測，再前往健康回報。")
-        else:
-            st.session_state.page = "questionnaire"
-
-with dashboard_row_2[0]:
-    if st.button("📅 歷史紀錄", use_container_width=True, disabled=is_locked):
-        if st.session_state.is_monitoring:
-            st.warning("請先結束監測，再查看歷史紀錄。")
-        else:
-            st.session_state.page = "history"
-
-with dashboard_row_2[1]:
-    if st.button("☁️ 上傳雲端", use_container_width=True, disabled=is_locked):
-        if st.session_state.is_monitoring:
-            st.warning("請先結束監測，再執行雲端上傳。")
-        else:
-            current_user_id = get_current_user_id()
-            uploaded_count, error_message = upload_user_health_logs_to_fhir(
-                current_user_id,
-                st.session_state.patient_id,
-            )
-            if error_message:
-                st.error(error_message)
+    with dashboard_row_1[1]:
+        if st.button("📝 健康回報", width="stretch"):
+            if st.session_state.is_monitoring:
+                st.warning("請先結束監測，再前往健康回報。")
             else:
-                st.success(f"已成功上傳 {uploaded_count} 筆本地健康紀錄到 FHIR 雲端。")
+                st.session_state.page = "questionnaire"
 
-if st.session_state.authenticated:
+    with dashboard_row_2[0]:
+        if st.button("📅 歷史紀錄", width="stretch"):
+            if st.session_state.is_monitoring:
+                st.warning("請先結束監測，再查看歷史紀錄。")
+            else:
+                st.session_state.page = "history"
+
+    with dashboard_row_2[1]:
+        if st.button("☁️ 上傳雲端", width="stretch"):
+            if st.session_state.is_monitoring:
+                st.warning("請先結束監測，再執行雲端上傳。")
+            else:
+                current_user_id = get_current_user_id()
+                uploaded_count, error_message = upload_user_health_logs_to_fhir(
+                    current_user_id,
+                    st.session_state.patient_id,
+                )
+                if error_message:
+                    st.error(error_message)
+                else:
+                    st.success(f"已成功上傳 {uploaded_count} 筆本地健康紀錄到 FHIR 雲端。")
+
     current_user_id = get_current_user_id()
     st.divider()
 
@@ -1233,3 +1385,47 @@ if st.session_state.authenticated:
         render_history_section(current_user_id)
     else:
         st.info("請從上方主控台選擇功能。")
+
+
+def main():
+    initialize_session_state()
+
+    st.markdown(
+        f"""
+        <style>
+            .stApp {{
+                background-color: {st.session_state.bg_color};
+                transition: background-color 0.3s;
+            }}
+            div[data-testid="stButton"] > button {{
+                min-height: 88px;
+                font-size: 1.05rem;
+                font-weight: 700;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    render_sidebar_controls()
+
+    try:
+        users_payload = load_users()
+    except ValueError as exc:
+        st.error(str(exc))
+        st.error("users.json 格式無效，無法啟動驗證流程。")
+        st.stop()
+
+    st.session_state.logged_in = bool(
+        st.session_state.get("logged_in") or st.session_state.get("authenticated")
+    )
+    st.session_state.authenticated = st.session_state.logged_in
+
+    if not st.session_state.logged_in:
+        render_login_page(users_payload)
+        st.stop()
+
+    render_dashboard(users_payload)
+
+
+main()
