@@ -1068,7 +1068,7 @@ def render_monitor_section(current_user_id):
 
             raw_val = float(line.split(",")[0])
 
-            if abs(raw_val) > 500.0:
+            if abs(raw_val) > 150.0:
                 processed += 1
                 continue
 
