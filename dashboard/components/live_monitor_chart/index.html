@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SkateSafe Live Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --accent: #7ee787;
+      --grid: #21262d;
+      --alert: #ff7b72;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Noto Sans TC", sans-serif;
+    }
+    .shell {
+      width: 100%;
+      height: 100%;
+      min-height: 470px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(22,27,34,0.98), rgba(13,17,23,0.98));
+      padding: 18px;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 16px;
+    }
+    .metric-label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+    .metric-value {
+      font-size: 36px;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: 0.02em;
+    }
+    .status {
+      text-align: right;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .status strong {
+      display: block;
+      color: var(--text);
+      font-size: 15px;
+      margin-top: 4px;
+    }
+    .chart-wrap {
+      position: relative;
+      min-height: 340px;
+      height: 100%;
+      border-radius: 14px;
+      background:
+        linear-gradient(180deg, rgba(126, 231, 135, 0.04), rgba(0, 0, 0, 0)),
+        var(--panel);
+      border: 1px solid rgba(126, 231, 135, 0.08);
+      overflow: hidden;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .footer {
+      min-height: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .footer.error {
+      color: var(--alert);
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div>
+        <div class="metric-label">當前加速度</div>
+        <div class="metric-value" id="metricValue">0.00 G</div>
+      </div>
+      <div class="status" id="statusText">
+        監測狀態
+        <strong>等待資料</strong>
+      </div>
+    </div>
+    <div class="chart-wrap" id="chartWrap">
+      <canvas id="chartCanvas"></canvas>
+    </div>
+    <div class="footer" id="debugLine"></div>
+  </div>
+
+  <script>
+    const config = __SKATESAFE_CONFIG__;
+    const canvas = document.getElementById("chartCanvas");
+    const chartWrap = document.getElementById("chartWrap");
+    const metricValue = document.getElementById("metricValue");
+    const statusText = document.getElementById("statusText");
+    const debugLine = document.getElementById("debugLine");
+    const ctx = canvas.getContext("2d");
+
+    let targetHistory = new Array(40).fill(0);
+    let renderedHistory = new Array(40).fill(0);
+    let currentYBound = 4;
+    let targetYBound = 4;
+    let latestValue = 0;
+    let runtimeStatus = "等待資料";
+    let footerText = "";
+    let footerIsError = false;
+    let lastUpdatedAt = "";
+
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = chartWrap.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+
+    function computeTargetYBound(history) {
+      const maxAbs = history.reduce((acc, value) => Math.max(acc, Math.abs(value)), 0);
+      return Math.min(Math.max(2, maxAbs * 1.15), 20);
+    }
+
+    function setStatus(snapshot) {
+      if (!snapshot) {
+        runtimeStatus = "等待資料";
+        footerText = "尚未收到監測資料";
+        footerIsError = false;
+        return;
+      }
+
+      latestValue = Number(snapshot.latest_value || 0);
+      lastUpdatedAt = snapshot.updated_at || "";
+      if (snapshot.status === "error") {
+        runtimeStatus = "監測異常";
+      } else if (snapshot.monitoring) {
+        runtimeStatus = "監測中";
+      } else {
+        runtimeStatus = "已停止";
+      }
+
+      if (config.showDebug) {
+        const debug = snapshot.debug || {};
+        const parts = [
+          `原始資料: ${(debug.raw_line || "尚未收到資料").slice(0, 80)}`,
+          `最近解析: ${Number(snapshot.latest_raw_total || 0).toFixed(3)} G`,
+          `單位模式: ${debug.unit_mode || "未判定"}`,
+          `最近錯誤: ${(debug.last_error || "無").slice(0, 80)}`,
+        ];
+        footerText = parts.join(" | ");
+      } else {
+        footerText = snapshot.status === "error"
+          ? (snapshot.debug?.last_error || "監測發生錯誤")
+          : `最後更新：${lastUpdatedAt || "尚未收到資料"}`;
+      }
+      footerIsError = snapshot.status === "error";
+    }
+
+    async function pollSnapshot() {
+      try {
+        const response = await fetch(`${config.serverUrl}/snapshot?ts=${Date.now()}`, {
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const snapshot = await response.json();
+        if (Array.isArray(snapshot.history) && snapshot.history.length) {
+          targetHistory = snapshot.history.map((value) => Number(value || 0));
+          targetYBound = computeTargetYBound(targetHistory);
+        }
+        setStatus(snapshot);
+      } catch (error) {
+        runtimeStatus = "連線中斷";
+        footerText = `圖表端點讀取失敗：${error.message}`;
+        footerIsError = true;
+      }
+    }
+
+    function drawGrid(width, height, padding) {
+      ctx.strokeStyle = "rgba(139,148,158,0.18)";
+      ctx.lineWidth = 1;
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const xSteps = 4;
+      const ySteps = 4;
+
+      for (let i = 0; i <= xSteps; i += 1) {
+        const x = padding.left + (innerWidth * i) / xSteps;
+        ctx.beginPath();
+        ctx.moveTo(x, padding.top);
+        ctx.lineTo(x, height - padding.bottom);
+        ctx.stroke();
+      }
+
+      for (let i = 0; i <= ySteps; i += 1) {
+        const y = padding.top + (innerHeight * i) / ySteps;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(width - padding.right, y);
+        ctx.stroke();
+      }
+    }
+
+    function drawAxisLabels(width, height, padding) {
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const xSteps = 4;
+      const ySteps = 4;
+
+      ctx.fillStyle = "rgba(139,148,158,0.92)";
+      ctx.font = '12px "Segoe UI", "Noto Sans TC", sans-serif';
+      ctx.textBaseline = "middle";
+
+      for (let i = 0; i <= ySteps; i += 1) {
+        const ratio = i / ySteps;
+        const y = padding.top + innerHeight * ratio;
+        const value = currentYBound - (currentYBound * 2 * ratio);
+        const label = `${value >= 0 ? "+" : ""}${value.toFixed(1)} G`;
+        ctx.textAlign = "right";
+        ctx.fillText(label, padding.left - 10, y);
+      }
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      for (let i = 0; i <= xSteps; i += 1) {
+        const ratio = i / xSteps;
+        const x = padding.left + innerWidth * ratio;
+        const sampleIndex = Math.round((39 * i) / xSteps);
+        ctx.fillText(String(sampleIndex), x, height - padding.bottom + 10);
+      }
+    }
+
+    function drawLine(width, height, padding) {
+      const innerWidth = width - padding.left - padding.right;
+      const innerHeight = height - padding.top - padding.bottom;
+      const denominator = Math.max(1, renderedHistory.length - 1);
+
+      ctx.beginPath();
+      renderedHistory.forEach((value, index) => {
+        const x = padding.left + (innerWidth * index) / denominator;
+        const normalized = (value + currentYBound) / (currentYBound * 2);
+        const y = padding.top + innerHeight * (1 - normalized);
+        if (index === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+
+      ctx.strokeStyle = "#7ee787";
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+
+    function renderFrame() {
+      const width = chartWrap.clientWidth;
+      const height = chartWrap.clientHeight;
+      const padding = { top: 16, right: 18, bottom: 34, left: 64 };
+
+      currentYBound += (targetYBound - currentYBound) * 0.08;
+      renderedHistory = renderedHistory.map((value, index) => {
+        const nextValue = targetHistory[index] ?? 0;
+        return value + (nextValue - value) * 0.22;
+      });
+
+      ctx.clearRect(0, 0, width, height);
+      drawGrid(width, height, padding);
+      drawAxisLabels(width, height, padding);
+      drawLine(width, height, padding);
+
+      metricValue.textContent = `${latestValue.toFixed(2)} G`;
+      statusText.innerHTML = `監測狀態<strong>${runtimeStatus}</strong>`;
+      debugLine.textContent = footerText;
+      debugLine.className = footerIsError ? "footer error" : "footer";
+
+      window.requestAnimationFrame(renderFrame);
+    }
+
+    resizeCanvas();
+    new ResizeObserver(resizeCanvas).observe(chartWrap);
+    window.setInterval(pollSnapshot, 50);
+    pollSnapshot();
+    window.requestAnimationFrame(renderFrame);
+  </script>
+</body>
+</html>

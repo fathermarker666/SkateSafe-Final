@@ -1,6 +1,7 @@
 ﻿# 隱私資料，絕對不能上傳 GitHub
 users.json
 user_health_logs.json
+auth_sessions.json
 
 # Python 快取與環境
 __pycache__/

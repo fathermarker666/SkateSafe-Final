@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -10,13 +11,19 @@ import pandas as pd
 import requests
 import serial
 import streamlit as st
+import streamlit.components.v1 as components
 from serial.tools import list_ports
 
+from monitor_runtime import SerialMonitorRuntime
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 USERS_PATH = ROOT_DIR / "users.json"
+AUTH_SESSIONS_PATH = ROOT_DIR / "auth_sessions.json"
 IMPACT_LOG_PATH = ROOT_DIR / "impact_log.json"
 USER_HEALTH_LOGS_PATH = ROOT_DIR / "user_health_logs.json"
+LIVE_MONITOR_COMPONENT_PATH = (
+    ROOT_DIR / "dashboard" / "components" / "live_monitor_chart" / "index.html"
+)
 FHIR_BASE_URL = "https://tzuchi-fhir.ddns.net/fhir"
 DEFAULT_BG_COLOR = "#0e1117"
 ALERT_BG_COLOR = "#4a0000"
@@ -41,6 +48,7 @@ def initialize_session_state():
         "raw_total_window": [],
         "logged_in": False,
         "authenticated": False,
+        "auth_token": "",
         "user_email": "",
         "user_name": "",
         "patient_id": "",
@@ -54,6 +62,8 @@ def initialize_session_state():
         "selected_port": "COM8",
         "is_monitoring": False,
         "has_impact_occurred": False,
+        "monitor_runtime": None,
+        "monitor_server_url": "",
         "impact_flash_until": 0.0,
         "latest_impact_fhir_json": "",
         "show_monitor_debug": False,
@@ -78,12 +88,15 @@ def reset_monitoring_state():
     st.session_state.serial_debug_last_total_g = None
     st.session_state.serial_debug_last_error = ""
     st.session_state.serial_debug_unit_mode = "未判定"
+    st.session_state.show_monitor_debug = False
 
 
 def clear_auth_state():
-    close_serial_connection()
+    clear_persistent_auth_session()
+    stop_monitor_runtime()
     st.session_state.logged_in = False
     st.session_state.authenticated = False
+    st.session_state.auth_token = ""
     st.session_state.user_email = ""
     st.session_state.user_name = ""
     st.session_state.patient_id = ""
@@ -125,6 +138,96 @@ def save_users(users_payload):
     )
 
 
+def load_auth_sessions():
+    if not AUTH_SESSIONS_PATH.exists():
+        return {}
+
+    try:
+        sessions_payload = json.loads(AUTH_SESSIONS_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(sessions_payload, dict):
+        return {}
+
+    return sessions_payload
+
+
+def save_auth_sessions(sessions_payload):
+    AUTH_SESSIONS_PATH.write_text(
+        json.dumps(sessions_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def get_query_auth_token():
+    token = st.query_params.get("auth_token", "")
+    if isinstance(token, list):
+        return token[0] if token else ""
+    return str(token or "")
+
+
+def set_query_auth_token(token):
+    if token:
+        st.query_params["auth_token"] = token
+    elif "auth_token" in st.query_params:
+        del st.query_params["auth_token"]
+
+
+def create_persistent_auth_session(user_record):
+    token = secrets.token_urlsafe(32)
+    sessions_payload = load_auth_sessions()
+    sessions_payload[token] = {
+        "email": normalize_email(user_record["email"]),
+        "patient_id": user_record["patient_id"],
+        "created_at": datetime.now().isoformat(),
+    }
+    save_auth_sessions(sessions_payload)
+    st.session_state.auth_token = token
+    set_query_auth_token(token)
+    return token
+
+
+def clear_persistent_auth_session():
+    active_token = st.session_state.get("auth_token") or get_query_auth_token()
+    if active_token:
+        sessions_payload = load_auth_sessions()
+        if active_token in sessions_payload:
+            del sessions_payload[active_token]
+            save_auth_sessions(sessions_payload)
+
+    st.session_state.auth_token = ""
+    set_query_auth_token("")
+
+
+def restore_persistent_auth_session(users_payload):
+    auth_token = get_query_auth_token()
+    if not auth_token:
+        return False
+
+    sessions_payload = load_auth_sessions()
+    auth_session = sessions_payload.get(auth_token)
+    if not isinstance(auth_session, dict):
+        set_query_auth_token("")
+        return False
+
+    matched_user = find_user(users_payload, auth_session.get("email", ""))
+    if not matched_user:
+        del sessions_payload[auth_token]
+        save_auth_sessions(sessions_payload)
+        set_query_auth_token("")
+        return False
+
+    patient_resource, error_message = fetch_patient_resource(matched_user["patient_id"])
+    if error_message:
+        st.warning(f"無法還原持續登入狀態：{error_message}")
+        return False
+
+    start_authenticated_session(matched_user, patient_resource)
+    st.session_state.auth_token = auth_token
+    return True
+
+
 def get_current_user_id():
     patient_id = st.session_state.get("patient_id", "")
     if "/" not in patient_id:
@@ -148,7 +251,7 @@ def load_user_health_logs(show_error=True):
             st.error("user_health_logs.json 必須是 JSON 陣列。")
         return None
 
-    return health_logs
+    return [ensure_cloud_sync_metadata(entry) for entry in health_logs]
 
 
 def save_user_health_logs(logs):
@@ -158,12 +261,39 @@ def save_user_health_logs(logs):
     )
 
 
+def ensure_cloud_sync_metadata(entry):
+    if not isinstance(entry, dict):
+        return entry
+
+    cloud_sync = entry.get("cloud_sync")
+    if not isinstance(cloud_sync, dict):
+        cloud_sync = {}
+
+    cloud_sync.setdefault("uploaded", False)
+    cloud_sync.setdefault("uploaded_at", None)
+    cloud_sync.setdefault("resource_types", [])
+    entry["cloud_sync"] = cloud_sync
+    return entry
+
+
+def is_log_uploaded(entry):
+    cloud_sync = entry.get("cloud_sync")
+    return isinstance(cloud_sync, dict) and cloud_sync.get("uploaded") is True
+
+
+def mark_log_uploaded(entry, resource_types):
+    ensure_cloud_sync_metadata(entry)
+    entry["cloud_sync"]["uploaded"] = True
+    entry["cloud_sync"]["uploaded_at"] = datetime.now().isoformat()
+    entry["cloud_sync"]["resource_types"] = list(resource_types)
+
+
 def append_user_health_log(entry):
     health_logs = load_user_health_logs(show_error=False)
     if health_logs is None:
         raise ValueError("user_health_logs.json 格式無效，無法寫入健康紀錄。")
 
-    health_logs.append(entry)
+    health_logs.append(ensure_cloud_sync_metadata(dict(entry)))
     save_user_health_logs(health_logs)
 
 
@@ -619,6 +749,81 @@ def export_history_to_fhir_bundle(history_values, patient_id):
     }
 
 
+def handle_runtime_impact(user_id, patient_id, g_force, history_snapshot):
+    log_entry = {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "g": g_force,
+    }
+    with IMPACT_LOG_PATH.open("a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(log_entry) + "\n")
+
+    impact_event_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "user_id": user_id,
+        "type": "impact_event",
+        "symptom": "",
+        "note": "偵測到重擊事件",
+        "g_force": g_force,
+    }
+
+    try:
+        append_user_health_log(impact_event_entry)
+    except (OSError, ValueError):
+        pass
+
+    if patient_id and history_snapshot:
+        return json.dumps(
+            export_history_to_fhir_bundle(history_snapshot, patient_id),
+            ensure_ascii=False,
+            indent=2,
+        )
+    return ""
+
+
+def stop_monitor_runtime():
+    runtime = st.session_state.get("monitor_runtime")
+    if runtime:
+        runtime.stop()
+    st.session_state.monitor_runtime = None
+    st.session_state.monitor_server_url = ""
+
+
+def sync_runtime_snapshot_to_session(snapshot):
+    if not snapshot:
+        return
+
+    st.session_state.history = snapshot.get("history", [0.0] * 40)
+    st.session_state.has_impact_occurred = snapshot.get("has_impact_occurred", False)
+    st.session_state.current_g_force = snapshot.get("latest_impact_g")
+    latest_fhir_json = snapshot.get("latest_impact_fhir_json", "")
+    if latest_fhir_json:
+        st.session_state.latest_impact_fhir_json = latest_fhir_json
+
+
+def build_live_monitor_component_html(server_url, show_debug):
+    template = LIVE_MONITOR_COMPONENT_PATH.read_text(encoding="utf-8")
+    config_json = json.dumps(
+        {
+            "serverUrl": server_url,
+            "showDebug": bool(show_debug),
+        },
+        ensure_ascii=False,
+    )
+    return template.replace("__SKATESAFE_CONFIG__", config_json)
+
+
+def render_live_monitor_chart_component(server_url, show_debug):
+    if not server_url:
+        st.error("監測圖表端點尚未啟動。")
+        return
+
+    components.html(
+        build_live_monitor_component_html(server_url, show_debug),
+        height=500,
+        scrolling=False,
+    )
+
+
 def get_available_ports():
     try:
         ports = [port.device for port in list_ports.comports()]
@@ -661,9 +866,19 @@ def close_serial_connection(port=None):
 
 
 def start_monitoring_session():
-    close_serial_connection()
+    stop_monitor_runtime()
     reset_monitoring_state()
     st.session_state.bg_color = DEFAULT_BG_COLOR
+    runtime = SerialMonitorRuntime(
+        port=st.session_state.selected_port,
+        patient_id=st.session_state.patient_id,
+        user_id=get_current_user_id(),
+        impact_threshold=st.session_state.get("impact_threshold", 50.0),
+        on_impact=handle_runtime_impact,
+    )
+    runtime.start()
+    st.session_state.monitor_runtime = runtime
+    st.session_state.monitor_server_url = runtime.server_url
     st.session_state.is_monitoring = True
     st.session_state.has_impact_occurred = False
     st.session_state.impact_flash_until = 0.0
@@ -674,10 +889,15 @@ def start_monitoring_session():
 
 
 def stop_and_finalize_monitoring():
+    snapshot = None
+    runtime = st.session_state.get("monitor_runtime")
+    if runtime:
+        snapshot = runtime.get_snapshot()
+    sync_runtime_snapshot_to_session(snapshot)
     st.session_state.is_monitoring = False
     st.session_state.bg_color = DEFAULT_BG_COLOR
     st.session_state.impact_flash_until = 0.0
-    close_serial_connection()
+    stop_monitor_runtime()
     if "chart_container" in st.session_state:
         del st.session_state.chart_container
 
@@ -821,32 +1041,55 @@ def build_log_upload_resources(entry, patient_id):
 def upload_user_health_logs_to_fhir(user_id, patient_id):
     health_logs = load_user_health_logs(show_error=True)
     if health_logs is None:
-        return 0, "無法讀取 user_health_logs.json。"
+        return 0, 0, "無法讀取 user_health_logs.json。"
 
-    user_logs = [entry for entry in health_logs if entry.get("user_id") == user_id]
-    if not user_logs:
-        return 0, "目前沒有可上傳的本地健康紀錄。"
+    pending_indexes = [
+        index
+        for index, entry in enumerate(health_logs)
+        if entry.get("user_id") == user_id and not is_log_uploaded(entry)
+    ]
+    if not pending_indexes:
+        return 0, 0, "目前沒有待上傳的本地健康紀錄。"
 
-    uploaded_count = 0
+    uploaded_resource_count = 0
+    uploaded_record_count = 0
     error_messages = []
+    changed = False
 
-    for entry in user_logs:
+    for index in pending_indexes:
+        entry = health_logs[index]
         resources = build_log_upload_resources(entry, patient_id)
         if not resources:
             continue
 
+        resource_types = []
+        entry_success = True
         for resource_type, payload in resources:
             _, error_message = upload_fhir_resource(resource_type, payload)
             if error_message:
                 error_messages.append(error_message)
+                entry_success = False
             else:
-                uploaded_count += 1
+                uploaded_resource_count += 1
+                resource_types.append(resource_type)
+
+        if entry_success:
+            mark_log_uploaded(entry, resource_types)
+            uploaded_record_count += 1
+            changed = True
+
+    if changed:
+        save_user_health_logs(health_logs)
 
     if error_messages:
         combined_errors = "；".join(error_messages[:2])
-        return uploaded_count, f"部分上傳失敗：{combined_errors}"
+        return (
+            uploaded_resource_count,
+            uploaded_record_count,
+            f"部分上傳失敗：{combined_errors}",
+        )
 
-    return uploaded_count, None
+    return uploaded_resource_count, uploaded_record_count, None
 
 
 def render_auth_panel(users_payload):
@@ -878,6 +1121,7 @@ def render_auth_panel(users_payload):
                     render_fhir_debug()
                 else:
                     start_authenticated_session(matched_user, patient_resource)
+                    create_persistent_auth_session(matched_user)
                     st.session_state.show_auth_panel = False
                     st.rerun()
 
@@ -918,6 +1162,7 @@ def render_auth_panel(users_payload):
                     users_payload["users"].append(new_user)
                     save_users(users_payload)
                     start_authenticated_session(new_user, patient_resource)
+                    create_persistent_auth_session(new_user)
                     st.session_state.show_auth_panel = False
                     st.rerun()
 
@@ -1118,6 +1363,24 @@ def build_monitor_debug_text():
     )
 
 
+def build_monitor_debug_text_from_snapshot(snapshot):
+    debug = snapshot.get("debug", {}) if isinstance(snapshot, dict) else {}
+    raw_line = debug.get("raw_line", "") or "尚未收到資料"
+    last_total = snapshot.get("latest_raw_total")
+    last_total_text = "尚未解析成功" if last_total is None else f"{last_total:.3f} G"
+    unit_mode = debug.get("unit_mode", "未判定")
+    last_error = debug.get("last_error", "") or "無"
+    status = snapshot.get("status", "unknown")
+
+    return (
+        f"狀態: {status}\n"
+        f"原始資料: {raw_line[:120]}\n"
+        f"最近解析: {last_total_text}\n"
+        f"單位模式: {unit_mode}\n"
+        f"最近錯誤: {last_error[:120]}"
+    )
+
+
 def build_monitor_chart(history_values):
     window = list(history_values[-40:])
     if len(window) < 40:
@@ -1256,19 +1519,35 @@ def render_monitor_section(current_user_id):
             key="impact_threshold",
         )
 
+        runtime = st.session_state.get("monitor_runtime")
+        snapshot = runtime.get_snapshot() if runtime else None
+        if runtime and st.session_state.is_monitoring:
+            runtime.update_config(impact_threshold=impact_threshold)
+
         if st.button("零點校準", width="stretch"):
-            recent_window = st.session_state.history[-10:]
-            st.session_state.offset = sum(recent_window) / len(recent_window)
+            if runtime and st.session_state.is_monitoring:
+                runtime.calibrate_zero()
+            else:
+                recent_window = st.session_state.history[-10:]
+                st.session_state.offset = sum(recent_window) / len(recent_window)
 
         if st.button("結束監測", width="stretch"):
             stop_and_finalize_monitoring()
             st.rerun()
 
-        st.toggle(
-            "顯示監測除錯資訊",
-            key="show_monitor_debug",
-            disabled=not st.session_state.is_monitoring,
-        )
+        with st.expander("監測除錯", expanded=False):
+            st.toggle(
+                "顯示詳細監測除錯資訊",
+                key="show_monitor_debug",
+                disabled=not st.session_state.is_monitoring,
+            )
+            if snapshot:
+                st.code(
+                    build_monitor_debug_text_from_snapshot(snapshot),
+                    language="text",
+                )
+            elif not st.session_state.is_monitoring:
+                st.caption("監測尚未啟動。")
 
         if not st.session_state.is_monitoring:
             if st.session_state.latest_impact_fhir_json:
@@ -1288,10 +1567,9 @@ def render_monitor_section(current_user_id):
                 )
 
     with chart_col:
-        render_monitor_fragment(
-            current_user_id,
-            impact_threshold,
-            st.session_state.selected_port,
+        render_live_monitor_chart_component(
+            st.session_state.get("monitor_server_url", ""),
+            st.session_state.get("show_monitor_debug", False),
         )
 
 
@@ -1360,19 +1638,26 @@ def render_dashboard(users_payload):
                 st.session_state.page = "history"
 
     with dashboard_row_2[1]:
-        if st.button("☁️ 上傳雲端", width="stretch"):
+        if st.button("☁️ 上傳未同步資料", width="stretch"):
             if st.session_state.is_monitoring:
                 st.warning("請先結束監測，再執行雲端上傳。")
             else:
                 current_user_id = get_current_user_id()
-                uploaded_count, error_message = upload_user_health_logs_to_fhir(
+                (
+                    uploaded_resource_count,
+                    uploaded_record_count,
+                    error_message,
+                ) = upload_user_health_logs_to_fhir(
                     current_user_id,
                     st.session_state.patient_id,
                 )
                 if error_message:
                     st.error(error_message)
                 else:
-                    st.success(f"已成功上傳 {uploaded_count} 筆本地健康紀錄到 FHIR 雲端。")
+                    st.success(
+                        f"已新同步 {uploaded_record_count} 筆紀錄 / "
+                        f"{uploaded_resource_count} 筆 FHIR 資源。"
+                    )
 
     current_user_id = get_current_user_id()
     st.divider()
@@ -1420,6 +1705,11 @@ def main():
         st.session_state.get("logged_in") or st.session_state.get("authenticated")
     )
     st.session_state.authenticated = st.session_state.logged_in
+
+    if not st.session_state.logged_in:
+        restored = restore_persistent_auth_session(users_payload)
+        st.session_state.logged_in = bool(restored or st.session_state.get("logged_in"))
+        st.session_state.authenticated = st.session_state.logged_in
 
     if not st.session_state.logged_in:
         render_login_page(users_payload)

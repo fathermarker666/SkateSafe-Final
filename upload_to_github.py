@@ -4,7 +4,7 @@ import subprocess
 # --- 請填寫你的資訊 ---
 GITHUB_USER = "fathermarker666"
 REPO_NAME = "SkateSafe-Final"
-COMMIT_MSG = "功能齊全，剩下圖表感官問題，以及上傳動作優化"
+COMMIT_MSG = "Final"
 
 def run_command(command):
     try:
